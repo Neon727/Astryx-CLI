@@ -10,7 +10,7 @@ loop specifically), but works with any local Hugging Face model.
 ```bash
 git clone https://github.com/Neon727/Astryx-CLI
 cd astryx-cli
-pip install -e .
+pip install -e
 ```
 
 That gives you a global `astryx` command — no more `cd`-ing into a scripts
