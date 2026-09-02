@@ -8,7 +8,7 @@ loop specifically), but works with any local Hugging Face model.
 ## Install
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/Neon727/Astryx-CLI
 cd astryx-cli
 pip install -e .
 ```
