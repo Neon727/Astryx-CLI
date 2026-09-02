@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "astryx-cli"
+version = "0.1.0"
+description = "A general-purpose agentic coding CLI, optimized for Astryx"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "rich>=13.0",
+    "torch>=2.1",
+    "transformers>=4.40",
+    "peft>=0.10",
+]
+
+[project.scripts]
+astryx = "astryx_cli.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["astryx_cli*"]
