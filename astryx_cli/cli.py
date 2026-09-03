@@ -190,27 +190,245 @@ class LocalEngine:
         return raw, prompt_tokens, completion_tokens
 
 
+class GGUFEngine:
+    """Wraps a GGUF model file (e.g. one found in Ollama's local store) via
+    llama-cpp-python. This is a genuinely different loading path from
+    LocalEngine -- transformers can't read GGUF, it's a different format
+    entirely -- so a model found in Ollama needs this, not LocalEngine."""
+
+    approx_tokens = False
+
+    def __init__(self, gguf_path: str, n_ctx: int = 8192):
+        try:
+            from llama_cpp import Llama
+        except ImportError:
+            raise ImportError(
+                f"Found a GGUF model at {gguf_path} (looks like it's from Ollama), but "
+                f"'llama-cpp-python' isn't installed, and that's what's needed to load GGUF "
+                f"files (transformers can't read this format). Install it with:\n"
+                f"  pip install llama-cpp-python"
+            )
+        self.llm = Llama(model_path=gguf_path, n_ctx=n_ctx, verbose=False)
+        self.max_context = n_ctx
+
+    def count_tokens(self, messages: list) -> int:
+        text = "\n".join(m["content"] for m in messages)
+        try:
+            return len(self.llm.tokenize(text.encode("utf-8")))
+        except Exception:
+            return len(text) // 4  # rough fallback if tokenize() has issues on this build
+
+    def generate_raw(self, messages: list, max_new_tokens: int = 1024, deterministic: bool = False) -> tuple[str, int, int]:
+        resp = self.llm.create_chat_completion(
+            messages=messages,
+            max_tokens=max_new_tokens,
+            temperature=0.0 if deterministic else 0.7,
+        )
+        raw = resp["choices"][0]["message"]["content"] or ""
+        usage = resp.get("usage", {})
+        prompt_tokens = usage.get("prompt_tokens", self.count_tokens(messages))
+        completion_tokens = usage.get("completion_tokens", len(raw) // 4)
+        return raw, prompt_tokens, completion_tokens
+
+
+def _merged_model_candidates() -> list[str]:
+    """Where a merged Astryx model might live, in priority order. The env
+    var (ASTRYX_MERGED_PATH, defaulting to ~/.astryx/astryx-merged) comes
+    first since it's the documented, intentional way to point at one --
+    everything after that is a "did you maybe just leave it somewhere
+    normal" fallback rather than something to rely on long-term."""
+    cwd = os.getcwd()
+    candidates = [ASTRYX_MERGED_PATH]
+    candidates += [os.path.join(cwd, up, "out", "astryx-merged") for up in (".", "..", "../..", "../../..")]
+    candidates += [
+        os.path.join(cwd, "astryx-merged"),
+        os.path.expanduser("~/models/astryx-merged"),
+        os.path.expanduser("~/Downloads/astryx-merged"),
+        os.path.expanduser("~/Desktop/astryx-merged"),
+    ]
+    return candidates
+
+
+def _adapter_candidates() -> list[str]:
+    cwd = os.getcwd()
+    candidates = [ASTRYX_ADAPTER_PATH]
+    candidates += [os.path.join(cwd, up, "out", "astryx-lora") for up in (".", "..", "../..", "../../..")]
+    candidates += [
+        os.path.join(cwd, "astryx-lora"),
+        os.path.expanduser("~/models/astryx-lora"),
+        os.path.expanduser("~/Downloads/astryx-lora"),
+    ]
+    return candidates
+
+
+def _search_hf_cache(name_fragment: str) -> str | None:
+    """Covers the case where the model was pulled via from_pretrained with
+    a Hub repo id rather than placed locally -- HF's cache layout is
+    ~/.cache/huggingface/hub/models--<org>--<name>/snapshots/<hash>/,
+    so a plain path check would never find it there."""
+    cache_dir = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub"
+    )
+    if not os.path.isdir(cache_dir):
+        return None
+    matches = [d for d in os.listdir(cache_dir) if name_fragment.lower() in d.lower()]
+    if not matches:
+        return None
+    for match in sorted(matches):
+        snapshots_dir = os.path.join(cache_dir, match, "snapshots")
+        if not os.path.isdir(snapshots_dir):
+            continue
+        hashes = os.listdir(snapshots_dir)
+        if not hashes:
+            continue
+        hashes.sort(key=lambda h: os.path.getmtime(os.path.join(snapshots_dir, h)), reverse=True)
+        candidate = os.path.join(snapshots_dir, hashes[0])
+        if os.path.exists(os.path.join(candidate, "config.json")):
+            return candidate
+    return None
+
+
+def _search_ollama(name_fragment: str) -> str | None:
+    """Ollama stores models as GGUF blobs referenced by manifest files under
+    ~/.ollama/models/manifests/.../<model>/<tag>, with the actual weight
+    file at models/blobs/sha256-<hash>. This walks the manifest tree for a
+    name match and resolves it to the actual GGUF file path -- a plain
+    directory listing wouldn't find anything since Ollama's names aren't
+    the filenames, they're inside JSON manifests."""
+    ollama_dir = os.environ.get("OLLAMA_MODELS", os.path.expanduser("~/.ollama/models"))
+    manifests_dir = os.path.join(ollama_dir, "manifests")
+    if not os.path.isdir(manifests_dir):
+        return None
+    for root, _dirs, files in os.walk(manifests_dir):
+        if name_fragment.lower() not in root.lower():
+            continue
+        for fname in files:
+            try:
+                with open(os.path.join(root, fname)) as f:
+                    manifest = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            for layer in manifest.get("layers", []):
+                if not layer.get("mediaType", "").endswith(".model"):
+                    continue
+                digest = layer.get("digest", "").replace(":", "-")
+                blob_path = os.path.join(ollama_dir, "blobs", digest)
+                if os.path.exists(blob_path):
+                    return blob_path
+    return None
+
+
+def find_astryx_model() -> tuple[str | None, str, list[str]]:
+    """Searches for a trained Astryx model across common locations rather
+    than only checking the one default path. Returns (path, kind, tried)
+    where kind is "merged", "adapter", or "gguf" (found via Ollama), path
+    is None if nothing was found anywhere, and tried lists every location
+    checked (for a clear error message rather than a mysterious failure)."""
+    tried = []
+
+    for path in _merged_model_candidates():
+        tried.append(path)
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, "config.json")):
+            return path, "merged", tried
+
+    hf_merged = _search_hf_cache("astryx-merged") or _search_hf_cache("astryx")
+    if hf_merged:
+        tried.append(hf_merged)
+        return hf_merged, "merged", tried
+    tried.append("(Hugging Face cache, searched for 'astryx')")
+
+    for path in _adapter_candidates():
+        tried.append(path)
+        if os.path.isdir(path) and os.path.exists(os.path.join(path, "adapter_config.json")):
+            return path, "adapter", tried
+
+    hf_adapter = _search_hf_cache("astryx-lora")
+    if hf_adapter:
+        tried.append(hf_adapter)
+        return hf_adapter, "adapter", tried
+    tried.append("(Hugging Face cache, searched for 'astryx-lora')")
+
+    ollama_match = _search_ollama("astryx")
+    if ollama_match:
+        tried.append(ollama_match)
+        return ollama_match, "gguf", tried
+    tried.append("(Ollama model store, searched for 'astryx')")
+
+    return None, "", tried
+
+
+def find_named_model(name: str) -> tuple[str | None, str, list[str]]:
+    """The generic version of find_astryx_model, for any --model value
+    that isn't 'astryx' and isn't already a directory sitting right there.
+    Searches the Hugging Face cache and Ollama's model store for a match
+    on the given name. Returns (path, kind, tried) where kind is "hf"
+    (a Hugging Face-format directory) or "gguf" (an Ollama/GGUF file)."""
+    tried = []
+
+    hf_match = _search_hf_cache(name)
+    tried.append(f"Hugging Face cache (searched for '{name}')")
+    if hf_match:
+        return hf_match, "hf", tried
+
+    ollama_match = _search_ollama(name)
+    tried.append(f"Ollama model store (searched for '{name}')")
+    if ollama_match:
+        return ollama_match, "gguf", tried
+
+    return None, "", tried
+
+
 def build_engine(model_arg: str) -> tuple[object, str]:
-    """Resolves --model into (engine, identity_name). Both branches load a
-    local Hugging Face model -- this CLI runs local models only; the cloud
-    providers in llm_providers.py are for the training-data generators,
-    not for inference here.
-    - "astryx" (default): local merged Astryx model, or base+adapter if
-      the merge step hasn't been run yet
-    - anything else: treated as a local HF model path/repo id -- this is
-      the "general purpose" path, works with any causal LM
+    """Resolves --model into (engine, identity_name).
+    - "astryx" (default): searches common locations for a trained Astryx
+      model (see find_astryx_model) -- merged model preferred, then
+      adapter, then a GGUF version found via Ollama
+    - a path that's already a valid local HF-format directory: loaded
+      directly, no searching needed
+    - anything else: searched by name in the Hugging Face cache and
+      Ollama's model store (see find_named_model); if neither has it,
+      falls through to treating it as a literal local path or Hub repo id
+      and letting from_pretrained do its own resolution (including its
+      own cache check and, network permitting, a download)
     """
     if model_arg == "astryx":
-        if os.path.isdir(ASTRYX_MERGED_PATH):
-            console.print(f"[dim]Loading merged Astryx model from {ASTRYX_MERGED_PATH}...[/dim]")
-            return LocalEngine(ASTRYX_MERGED_PATH), "Astryx"
-        console.print(f"[dim]No merged model at {ASTRYX_MERGED_PATH} -- loading "
-                       f"{ASTRYX_BASE_MODEL} + Astryx adapter instead. Run merge_adapter.py "
-                       f"to skip this step next time.[/dim]")
-        return LocalEngine(ASTRYX_BASE_MODEL, adapter_path=ASTRYX_ADAPTER_PATH), "Astryx"
+        path, kind, tried = find_astryx_model()
+        if path is None:
+            console.print(
+                "[red]Couldn't find a trained Astryx model anywhere. Checked:[/red]\n" +
+                "\n".join(f"  [dim]- {t}[/dim]" for t in tried) +
+                "\n\n[yellow]Point at it explicitly with ASTRYX_MERGED_PATH=/path/to/model, "
+                "or symlink it to ~/.astryx/astryx-merged.[/yellow]"
+            )
+            raise FileNotFoundError("No Astryx model found")
+        if kind == "merged":
+            console.print(f"[dim]Found merged Astryx model at {path}[/dim]")
+            return LocalEngine(path), "Astryx"
+        if kind == "adapter":
+            console.print(f"[dim]Found Astryx adapter at {path} -- loading on top of {ASTRYX_BASE_MODEL}[/dim]")
+            return LocalEngine(ASTRYX_BASE_MODEL, adapter_path=path), "Astryx"
+        console.print(f"[dim]Found Astryx as a GGUF model (via Ollama) at {path}[/dim]")
+        return GGUFEngine(path), "Astryx"
 
-    console.print(f"[dim]Loading local model {model_arg}...[/dim]")
     identity = os.path.basename(model_arg.rstrip("/")) or "Assistant"
+
+    if os.path.isdir(model_arg) and os.path.exists(os.path.join(model_arg, "config.json")):
+        console.print(f"[dim]Loading local model from {model_arg}...[/dim]")
+        return LocalEngine(model_arg), identity
+
+    path, kind, tried = find_named_model(identity)
+    if kind == "hf":
+        console.print(f"[dim]Found '{model_arg}' in the Hugging Face cache at {path}[/dim]")
+        return LocalEngine(path), identity
+    if kind == "gguf":
+        console.print(f"[dim]Found '{model_arg}' in Ollama's model store -- loading via llama.cpp[/dim]")
+        return GGUFEngine(path), identity
+
+    # Not found in either cache -- fall through and let from_pretrained try
+    # its own resolution (local path or Hub repo id, with a download if
+    # it's neither cached nor local and network access is available)
+    console.print(f"[dim]Not found in local caches ({', '.join(tried)}) -- "
+                   f"trying '{model_arg}' as a direct path or Hub repo id...[/dim]")
     return LocalEngine(model_arg), identity
 
 
@@ -841,6 +1059,12 @@ def main():
 
     try:
         engine, identity = build_engine(args.model)
+    except FileNotFoundError:
+        # build_engine already printed exactly which locations it checked --
+        # no need to repeat a generic message on top of that.
+        if sandbox is not None:
+            sandbox.stop()
+        return
     except Exception as e:
         console.print(f"[red]Couldn't load model '{args.model}': {e}[/red]")
         if sandbox is not None:
