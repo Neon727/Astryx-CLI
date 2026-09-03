@@ -9,27 +9,65 @@ loop specifically), but works with any local Hugging Face model.
 
 ```bash
 git clone https://github.com/Neon727/Astryx-CLI
-cd astryx-cli
-pip install -e
+cd Astryx-CLI
+pip install -e .
 ```
 
-That gives you a global `astryx` command — no more `cd`-ing into a scripts
-folder or typing `python astryx_cli.py` every time.
+That gives you a global `astryx` command, usable from any directory.
 
 Optional, only if you use `--sandbox`: [Docker](https://docs.docker.com/get-docker/), installed and running.
 
-## Pointing it at a trained Astryx model
+Optional, only if you want to run a GGUF model (e.g. one pulled via
+Ollama — see below):
 
-Since `astryx` now runs from anywhere, it needs a fixed place to look for
-things rather than a path relative to wherever you happen to be standing.
-That's `~/.astryx/` by default:
+```bash
+pip install -e ".[gguf]"
+```
 
-| What | Default location | Override |
-|---|---|---|
-| Merged model | `~/.astryx/astryx-merged` | `ASTRYX_MERGED_PATH` |
-| LoRA adapter (if not merged) | `~/.astryx/astryx-lora` | `ASTRYX_ADAPTER_PATH` |
-| Chat sessions | `~/.astryx/sessions` | `ASTRYX_SESSIONS_DIR` |
-| (base for all of the above) | `~/.astryx` | `ASTRYX_HOME` |
+## Pointing it at an Astryx model
+
+`--model astryx` (the default) searches a handful of common locations for
+a model rather than only checking one fixed path, in this order:
+
+1. `ASTRYX_MERGED_PATH` (defaults to `~/.astryx/astryx-merged`) — the
+   intentional, documented location; set this if you want to be explicit
+2. `./out/astryx-merged`, `../out/astryx-merged`, `../../out/astryx-merged`
+   relative to wherever you're running the command from — a common place
+   for a build/output step to have left one
+3. `~/models/astryx-merged`, `~/Downloads/astryx-merged`,
+   `~/Desktop/astryx-merged` — common places people just leave things
+   after downloading them
+4. The Hugging Face cache (`~/.cache/huggingface/hub`) — covers the case
+   where it was downloaded via a Hub repo id (`from_pretrained(...)`)
+   rather than placed locally
+5. Same search again for an adapter (`astryx-lora` instead of
+   `astryx-merged`) if no merged model turned up anywhere — loaded on top
+   of the Qwen3.5-9B base
+6. Ollama's local model store (`~/.ollama/models`) — covers `ollama pull
+   astryx`, if a GGUF build is available that way. A match here loads via
+   `GGUFEngine` (`llama-cpp-python`) instead of the usual `LocalEngine`
+
+If a merged model and an adapter both exist, the merged one wins (it's
+what you'd actually want — one self-contained model instead of a base +
+patch). If nothing is found anywhere, it errors out listing every
+location it checked, so you know exactly what to fix rather than getting
+a mysterious failure.
+
+**The reliable option is still to just put it where it's expected:**
+
+```bash
+# Symlink to wherever the model actually is
+mkdir -p ~/.astryx
+ln -s /path/to/astryx-merged ~/.astryx/astryx-merged
+
+# Or point the env var at it directly
+export ASTRYX_MERGED_PATH=/path/to/astryx-merged
+```
+
+The fallback search is there to save you a step in the common cases, not
+something to depend on long-term — if you're scripting this or setting up
+a fresh machine, be explicit with the env var or the symlink rather than
+relying on it happening to be in one of the searched spots.
 
 ## Quick start
 
@@ -99,11 +137,34 @@ resumable by its old id.
 
 ```bash
 astryx chat --model astryx                    # default
-astryx chat --model /path/to/local-model      # any local HF model
-astryx chat --model Qwen/Qwen2.5-7B-Instruct  # ...straight from the Hub
+astryx chat --model qwen2.5-coder             # searched by name (see below)
+astryx chat --model /path/to/local-model      # a local directory, used directly
+astryx chat --model Qwen/Qwen2.5-7B-Instruct  # a Hub repo id
 ```
 
-Local models only, this CLI does not support APIs for external services.
+Local models only — this CLI doesn't call out to cloud APIs for
+inference.
+
+Any `--model` value that isn't `astryx` and isn't already a valid local
+directory gets **searched by name**, in this order:
+
+1. The Hugging Face cache (`~/.cache/huggingface/hub`) — covers a model
+   you've already downloaded via `from_pretrained` under a Hub repo id
+2. Ollama's local model store (`~/.ollama/models`) — covers a model
+   you've pulled with `ollama pull <name>`. Ollama stores models as GGUF
+   files, a different format from what `transformers` reads, so a match
+   here loads through **`GGUFEngine`** (via `llama-cpp-python`) instead of
+   `LocalEngine` — install that piece with `pip install -e ".[gguf]"` if
+   you hit an error saying it's missing
+3. If neither has a match, it falls through to treating the value as a
+   literal local path or Hub repo id and lets `from_pretrained` do its own
+   resolution — which includes a download if it's a valid repo id you
+   have network access to and it isn't cached yet
+
+This search runs for `--model astryx` too (in `find_astryx_model`,
+alongside the fixed `~/.astryx/` locations) — so a trained Astryx model
+sitting in the Hugging Face cache or in Ollama gets picked up the same
+way a custom name would.
 
 Non-Astryx models weren't trained on the `<think>`/`<shell>` tag format —
 they get the exact same prompted instructions, and most current models
