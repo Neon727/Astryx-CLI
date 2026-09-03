@@ -6,9 +6,8 @@ top of whichever local model you point it at.
 
 Optimized for Astryx by default (it was trained specifically on this
 loop's <think>/<shell> format), but not locked to it -- swap in any local
-Hugging Face model with --model. (Cloud APIs -- Gemini/Claude/OpenAI/
-DeepSeek -- are used for generating training data in generate_trajectories.py
-and generate_multifile_trajectories.py, not here; this CLI runs local models.)
+Hugging Face model with --model. This CLI runs local models only, no
+cloud APIs.
 
 Usage:
   astryx run "write a function that reverses a linked list"    # one-shot task
