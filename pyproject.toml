@@ -15,6 +15,9 @@ dependencies = [
     "peft>=0.10",
 ]
 
+[project.optional-dependencies]
+gguf = ["llama-cpp-python>=0.2"]  # only needed for --model pointing at a GGUF/Ollama model
+
 [project.scripts]
 astryx = "astryx_cli.cli:main"
 
