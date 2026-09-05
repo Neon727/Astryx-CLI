@@ -10,8 +10,9 @@ Hugging Face model with --model. This CLI runs local models only, no
 cloud APIs.
 
 Usage:
-  astryx run "write a function that reverses a linked list"    # one-shot task
-  astryx run "fix the bug" --files utils.py main.py --tests test_main.py
+  astryx run "write a function that reverses a linked list"    # one-shot task,
+                                                                 # tests self-generated from the task
+  astryx run "fix the bug" --files utils.py main.py --tests test_main.py  # real test file
   astryx run "..." --max-iters 3          # cap coder<->critic<->reviser loops
   astryx run "..." --no-think             # hide reasoning traces, just show output
 
@@ -74,6 +75,7 @@ from rich.markdown import Markdown
 from rich.rule import Rule
 from rich.align import Align
 from rich.text import Text
+from rich.live import Live
 
 from .sandbox import Sandbox, SandboxError
 
@@ -125,6 +127,13 @@ def role_systems(identity: str) -> dict:
         "coder": f"You are {identity}, a coding agent. Write correct, clean Python solutions.",
         "critic": f"You are {identity}, acting as a code critic. Diagnose bugs precisely and concisely.",
         "reviser": f"You are {identity}, acting as a code reviser. Fix bugs based on the critique given.",
+        "tester": (
+            f"You are {identity}, acting as a test writer. Given a task description and a "
+            "candidate solution, write assert-based test cases that check the solution meets "
+            "the task's stated requirements. Base tests on what the task asked for, not on "
+            "confirming whatever the code currently happens to do -- a test that can't fail "
+            "isn't testing anything."
+        ),
     }
 
 
@@ -143,6 +152,26 @@ def chat_system(identity: str) -> str:
 # rather than assuming Astryx specifically. This is what makes the CLI
 # general-purpose: LocalEngine works with any local Hugging Face model.
 # ---------------------------------------------------------------------------
+
+class _InterruptCriteria:
+    """Duck-typed stopping criteria (not subclassed from transformers'
+    StoppingCriteria) so this module doesn't need transformers imported at
+    module level just to define it -- transformers.generate()'s
+    stopping_criteria list calls each entry as a plain callable
+    (input_ids, scores, **kwargs) -> bool, without an isinstance check, so
+    this works without the inheritance. Defined once here rather than
+    redefined inside generate_raw on every call.
+
+    Not runtime-verified against a live transformers install in this
+    environment (no GPU/model available to test against here) -- if a
+    transformers version ever tightens that duck-typing contract, this is
+    the first place to look."""
+    def __init__(self, stop_event):
+        self.stop_event = stop_event
+
+    def __call__(self, input_ids, scores, **kwargs):
+        return self.stop_event.is_set()
+
 
 class LocalEngine:
     """Wraps a local Hugging Face causal LM (+ optional LoRA adapter).
@@ -170,23 +199,57 @@ class LocalEngine:
         return len(self.tokenizer(prompt_text)["input_ids"])
 
     def generate_raw(self, messages: list, max_new_tokens: int = 1024, deterministic: bool = False) -> tuple[str, int, int]:
+        """Streams tokens live (via TextIteratorStreamer, generation running
+        on a background thread) instead of blocking silently until the
+        whole response is ready -- a long generation no longer looks like a
+        frozen terminal, and Ctrl+C actually interrupts it via a
+        StoppingCriteria checked each step, rather than just detaching from
+        a thread that keeps running regardless."""
+        import threading
+        from transformers import TextIteratorStreamer, StoppingCriteriaList
+
         prompt_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer(prompt_text, return_tensors="pt").to(self.model.device)
         prompt_tokens = inputs["input_ids"].shape[1]
 
-        with self._torch.no_grad():
-            output = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=not deterministic,
-                temperature=0.7 if not deterministic else None,
-                top_p=0.9 if not deterministic else None,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        stop_event = threading.Event()
 
-        completion_tokens = output.shape[1] - prompt_tokens
-        raw = self.tokenizer.decode(output[0][prompt_tokens:], skip_special_tokens=True)
-        return raw, prompt_tokens, completion_tokens
+        generation_kwargs = dict(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=not deterministic,
+            temperature=0.7 if not deterministic else None,
+            top_p=0.9 if not deterministic else None,
+            pad_token_id=self.tokenizer.eos_token_id,
+            streamer=streamer,
+            stopping_criteria=StoppingCriteriaList([_InterruptCriteria(stop_event)]),
+        )
+
+        thread = threading.Thread(target=self.model.generate, kwargs=generation_kwargs)
+        thread.start()
+
+        accumulated = ""
+        # transient=True: this live preview disappears once generation
+        # finishes, so it doesn't duplicate the polished reasoning-panel +
+        # Markdown rendering that run_agent_turn does with the final text.
+        # The raw <think>/<shell> tags are visible here mid-stream (there's
+        # no clean way to hide them before we know where they end) -- that's
+        # an intentional tradeoff: a slightly rough live preview in exchange
+        # for the terminal never appearing to hang during a long generation.
+        with Live(console=console, refresh_per_second=8, transient=True) as live:
+            try:
+                for chunk in streamer:
+                    accumulated += chunk
+                    live.update(Panel(accumulated[-2000:], title="[dim]generating...[/dim]", border_style="dim"))
+            except KeyboardInterrupt:
+                stop_event.set()
+                console.print("[yellow]Interrupted -- stopping generation...[/yellow]")
+
+        thread.join(timeout=10)
+
+        completion_tokens = len(self.tokenizer(accumulated)["input_ids"]) if accumulated else 0
+        return accumulated, prompt_tokens, completion_tokens
 
 
 class GGUFEngine:
@@ -218,16 +281,31 @@ class GGUFEngine:
             return len(text) // 4  # rough fallback if tokenize() has issues on this build
 
     def generate_raw(self, messages: list, max_new_tokens: int = 1024, deterministic: bool = False) -> tuple[str, int, int]:
-        resp = self.llm.create_chat_completion(
-            messages=messages,
-            max_tokens=max_new_tokens,
-            temperature=0.0 if deterministic else 0.7,
-        )
-        raw = resp["choices"][0]["message"]["content"] or ""
-        usage = resp.get("usage", {})
-        prompt_tokens = usage.get("prompt_tokens", self.count_tokens(messages))
-        completion_tokens = usage.get("completion_tokens", len(raw) // 4)
-        return raw, prompt_tokens, completion_tokens
+        """Streams via llama-cpp-python's stream=True, same live-preview
+        approach as LocalEngine -- see the comment there for why the raw
+        tags are visible mid-stream and why that's an accepted tradeoff."""
+        accumulated = ""
+        prompt_tokens = self.count_tokens(messages)
+        completion_tokens = 0
+
+        with Live(console=console, refresh_per_second=8, transient=True) as live:
+            try:
+                stream = self.llm.create_chat_completion(
+                    messages=messages,
+                    max_tokens=max_new_tokens,
+                    temperature=0.0 if deterministic else 0.7,
+                    stream=True,
+                )
+                for chunk in stream:
+                    delta = chunk["choices"][0].get("delta", {}).get("content", "")
+                    if delta:
+                        accumulated += delta
+                        live.update(Panel(accumulated[-2000:], title="[dim]generating...[/dim]", border_style="dim"))
+            except KeyboardInterrupt:
+                console.print("[yellow]Interrupted -- stopping generation...[/yellow]")
+
+        completion_tokens = len(accumulated) // 4
+        return accumulated, prompt_tokens, completion_tokens
 
 
 def _merged_model_candidates() -> list[str]:
@@ -666,7 +744,7 @@ def generate(engine, state: SessionState, identity: str, role: str, user_prompt:
         {"role": "system", "content": system},
         {"role": "user", "content": user_prompt},
     ]
-    role_color = {"coder": ACCENT, "critic": "yellow", "reviser": "magenta"}[role]
+    role_color = {"coder": ACCENT, "critic": "yellow", "reviser": "magenta", "tester": "green"}[role]
     answer = run_agent_turn(engine, state, messages, show_think, role.upper(), role_color, sandbox)
     state.history.append({"role": role, "answer": answer})
     return answer
@@ -682,6 +760,34 @@ def chat_turn(engine, state: SessionState, identity: str, messages: list, show_t
 # ---------------------------------------------------------------------------
 # One-shot loop: astryx run "..."
 # ---------------------------------------------------------------------------
+
+def generate_self_tests(engine, state: SessionState, identity: str, task: str,
+                         code: str, show_think: bool, sandbox: Sandbox | None = None) -> str:
+    """Writes verification tests from the task description when no --tests
+    file was given, so `--tests` is optional rather than required.
+
+    Honest limitation: the same model wrote the code and is now judging
+    what "correct" looks like, so this is a heuristic, not ground truth --
+    it can share the code's misunderstanding of the task, or (since it
+    does see the code, to know what function name to call) lean toward
+    confirming the implementation rather than independently checking it.
+    A real test file written by a human, or based on a real spec, verifies
+    something external; self-generated tests mostly catch the failures a
+    model would recognize as failures if you asked it to look again --
+    still meaningfully better than no check at all, but not a guarantee."""
+    user_prompt = (
+        f"Task: {task}\n\n"
+        f"Candidate solution:\n```python\n{code}\n```\n\n"
+        "Write 3-5 plain assert-based test cases (no pytest/unittest needed, no imports "
+        "of the solution -- assume the function is already defined) that check this meets "
+        "the task's requirements, including a reasonable edge case or two. Base the tests "
+        "on the task description's requirements, not on what the code currently does -- "
+        "they should be capable of catching a real bug if there is one. Return ONLY the "
+        "test code in a python code block."
+    )
+    raw = generate(engine, state, identity, "tester", user_prompt, show_think, sandbox)
+    return extract_code(raw)
+
 
 def run_loop(engine, identity: str, task: str, files: list[str] | None,
              tests: str | None, max_iters: int, show_think: bool,
@@ -700,6 +806,7 @@ def run_loop(engine, identity: str, task: str, files: list[str] | None,
         file_context = "\n\n".join(blocks)
 
     test_code = None
+    test_code_is_self_generated = False
     if tests:
         try:
             with open(tests) as f:
@@ -711,13 +818,27 @@ def run_loop(engine, identity: str, task: str, files: list[str] | None,
     code = extract_code(generate(engine, state, identity, "coder", coder_prompt, show_think, sandbox))
 
     if test_code is None:
-        console.print("[dim]No --tests file given -- skipping verification, returning first draft.[/dim]")
-        return code, state
+        console.print("[dim]No --tests file given -- generating self-tests from the task "
+                       "description instead...[/dim]")
+        self_tests = generate_self_tests(engine, state, identity, task, code, show_think, sandbox)
+        if self_tests.strip():
+            test_code = self_tests
+            test_code_is_self_generated = True
+        else:
+            console.print("[dim]Couldn't generate usable self-tests -- returning first draft "
+                           "without verification.[/dim]")
+            return code, state
+
+    if test_code_is_self_generated:
+        console.print("[yellow]Note: these tests were self-generated from the task description, "
+                       "not provided by you -- treat a pass as a heuristic signal, not proof "
+                       "of correctness. Pass --tests <file> for real verification.[/yellow]\n")
 
     for _ in range(max_iters):
         passed, error = run_tests_against(code, test_code)
         if passed:
-            console.print("[bold green]✓ Tests passed -- loop complete[/bold green]")
+            label = "self-generated tests" if test_code_is_self_generated else "tests"
+            console.print(f"[bold green]✓ Passed ({label}) -- loop complete[/bold green]")
             break
 
         console.print(f"[red]✗ Tests failed:[/red]\n{error}\n")
@@ -853,6 +974,40 @@ def print_session_transcript(session_id: str):
 # Persistent session: astryx chat
 # ---------------------------------------------------------------------------
 
+LOAD_MAX_BYTES = 200_000  # ~50k tokens at a rough 4 bytes/token -- generous for a
+                          # source file, small enough that one /load can't blow the
+                          # context budget or accidentally swallow a huge log/binary
+
+
+def _is_probably_binary(path: str, sniff_bytes: int = 8192) -> bool:
+    """Cheap heuristic: a null byte in the first few KB almost never shows
+    up in real text/source files, but is common in binaries. Not
+    airtight, but catches the actual failure mode (someone /load-ing a
+    compiled binary or an image by accident)."""
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(sniff_bytes)
+        return b"\x00" in chunk
+    except OSError:
+        return False
+
+
+def _load_guard(fpath: str) -> str | None:
+    """Returns an error message if fpath shouldn't be loaded, or None if
+    it's fine to read. Checked before the actual read so a multi-GB file
+    or a binary never gets pulled into memory at all."""
+    if not os.path.exists(fpath):
+        return f"{fpath} doesn't exist"
+    size = os.path.getsize(fpath)
+    if size > LOAD_MAX_BYTES:
+        return (f"{fpath} is {size:,} bytes -- over the {LOAD_MAX_BYTES:,} byte cap for "
+                f"/load. Large files eat context fast; consider loading a relevant "
+                f"excerpt instead, or ask the model to grep/read part of it via shell access.")
+    if _is_probably_binary(fpath):
+        return f"{fpath} looks like a binary file (found a null byte) -- /load is for text/source files."
+    return None
+
+
 def run_chat(engine, identity: str, model_arg: str, show_think: bool,
              sandbox: Sandbox | None = None, resume_id: str | None = None):
     state = SessionState(max_context=engine.max_context, approx=engine.approx_tokens)
@@ -913,6 +1068,10 @@ def run_chat(engine, identity: str, model_arg: str, show_think: bool,
 
         if stripped.startswith("/load "):
             fpath = stripped[len("/load "):].strip()
+            guard_error = _load_guard(fpath)
+            if guard_error:
+                console.print(f"[red]{guard_error}[/red]\n")
+                continue
             try:
                 with open(fpath) as f:
                     content = f.read()
@@ -987,7 +1146,10 @@ def main():
     run_p.add_argument("task", type=str)
     run_p.add_argument("--model", type=str, default="astryx", help=model_help)
     run_p.add_argument("--files", nargs="*", default=None, help="Files to include as context")
-    run_p.add_argument("--tests", type=str, default=None, help="Test file to verify against")
+    run_p.add_argument("--tests", type=str, default=None,
+                        help="Test file to verify against. If omitted, tests are self-generated "
+                             "from the task description instead (a heuristic check, not a "
+                             "guarantee -- see README).")
     run_p.add_argument("--max-iters", type=int, default=3)
     run_p.add_argument("--no-think", action="store_true", help="Hide reasoning traces")
     run_p.add_argument("--sandbox", action="store_true",
@@ -997,6 +1159,11 @@ def main():
                         help="Directory mounted into the sandbox container (default: ./astryx_sandbox)")
     run_p.add_argument("--sandbox-network", action="store_true",
                         help="Allow network access inside the sandbox (off by default)")
+    run_p.add_argument("--sandbox-nonroot", action="store_true",
+                        help="Run sandbox commands as a non-root user (uid 1000) instead of "
+                             "the container's default root -- more defense-in-depth, but can "
+                             "break commands that need to `pip install` or write to system "
+                             "paths inside the container. Off by default.")
 
     chat_p = sub.add_parser("chat", help="Interactive multi-turn chat")
     chat_p.add_argument("--model", type=str, default="astryx", help=model_help)
@@ -1008,6 +1175,11 @@ def main():
                          help="Directory mounted into the sandbox container (default: ./astryx_sandbox)")
     chat_p.add_argument("--sandbox-network", action="store_true",
                          help="Allow network access inside the sandbox (off by default)")
+    chat_p.add_argument("--sandbox-nonroot", action="store_true",
+                         help="Run sandbox commands as a non-root user (uid 1000) instead of "
+                              "the container's default root -- more defense-in-depth, but can "
+                              "break commands that need to `pip install` or write to system "
+                              "paths inside the container. Off by default.")
     chat_p.add_argument("--resume", type=str, nargs="?", const="last", default=None,
                          help="Resume a previous session. Give a session ID, or omit the value "
                               "(just '--resume') to resume the most recent one. See 'astryx sessions'.")
@@ -1034,7 +1206,8 @@ def main():
 
     sandbox = None
     if getattr(args, "sandbox", False):
-        sandbox = Sandbox(args.sandbox_dir, allow_network=args.sandbox_network)
+        sandbox = Sandbox(args.sandbox_dir, allow_network=args.sandbox_network,
+                           run_as_nonroot=args.sandbox_nonroot)
         try:
             sandbox.start()
             console.print(
