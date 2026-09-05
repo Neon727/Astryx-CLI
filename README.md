@@ -85,9 +85,19 @@ astryx chat
 ## `run` vs `chat`
 
 **`run`** is one-shot. Give it a task; it loops coder → critic → reviser
-using real test execution (if you pass `--tests`) until it passes or hits
-`--max-iters`; then it exits. Without `--tests`, it just returns the first
-draft with no verification loop.
+until it passes or hits `--max-iters`, then exits. Two ways to verify:
+
+- **`--tests <file>`** — real execution against a test file you wrote.
+  This is the reliable option: it checks something external to the model.
+- **No `--tests` given** — a "tester" role writes assert-based tests from
+  the task description itself, and those get run instead. This is a
+  **heuristic, not a guarantee**: the same model wrote the code and is now
+  judging what "correct" looks like, so it can share the code's
+  misunderstanding of the task, or lean toward confirming the
+  implementation rather than independently checking it. The CLI prints a
+  clear warning when tests are self-generated so a pass doesn't get
+  mistaken for a real verification. Use `--tests` when correctness
+  actually matters.
 
 **`chat`** is persistent. Same agent, same loop, but it keeps the whole
 conversation in context — so after it writes something, you just keep
@@ -99,7 +109,7 @@ Inside `chat`:
 | Command | What it does |
 |---|---|
 | *(plain message)* | continues the conversation normally |
-| `/load <file>` | pulls a file's contents into context |
+| `/load <file>` | pulls a file's contents into context (capped at 200KB, rejects binaries) |
 | `/test <file>` | runs the last code block against a real test file; on failure, feeds the result back into the conversation and has it fix it |
 | `/reset` | clears history and starts a new session id (useful near the context ceiling) |
 | `/exit` | quit |
@@ -178,20 +188,30 @@ reasoning panel and carries on rather than breaking.
 |---|---|---|---|
 | `--model` | both | `astryx` | Which local model to load |
 | `--files` | `run` | none | Files to include as context |
-| `--tests` | `run` | none | Test file to verify generated code against |
+| `--tests` | `run` | none | Test file to verify against; if omitted, tests are self-generated from the task instead (see above) |
 | `--max-iters` | `run` | `3` | Cap on coder↔critic↔reviser loop iterations |
 | `--no-think` | both | off | Hide reasoning-trace panels |
 | `--sandbox` | both | off | Run shell commands in an isolated Docker container instead of confirming each on your host |
 | `--sandbox-dir` | both | `./astryx_sandbox` | Directory mounted into the sandbox container (cwd-relative on purpose — it mounts near whatever project you're currently in) |
 | `--sandbox-network` | both | off | Allow network access inside the sandbox |
+| `--sandbox-nonroot` | both | off | Run sandbox commands as uid 1000 instead of root — more defense-in-depth, but can break commands that need to `pip install` or write to system paths inside the container |
 | `--resume [id]` | `chat` | none | Resume a saved session; omit the id to resume the most recent one |
 
 ## What the CLI shows you
 
-- **Role-labeled reasoning traces** — coder, critic, and reviser each emit
-  a `<think>...</think>` block before acting, shown in a dim panel titled
-  with whichever role produced it, so it's clear which step you're
-  looking at.
+- **Streamed generation** — tokens appear live as the model generates
+  them, in a dim "generating..." panel, instead of the terminal sitting
+  silent until the whole response is ready. Ctrl+C during generation
+  actually interrupts it (via a stopping criteria checked each step for
+  local models), not just detaches from something that keeps running in
+  the background. The raw `<think>`/`<shell>` tags are visible during this
+  live preview — there's no clean way to hide them before generation
+  finishes — and the panel disappears once done, replaced by the normal
+  polished rendering below.
+- **Role-labeled reasoning traces** — coder, critic, tester, and reviser
+  each emit a `<think>...</think>` block before acting, shown in a dim
+  panel titled with whichever role produced it, so it's clear which step
+  you're looking at.
 - **Live context meter** — a progress bar tracking cumulative tokens used
   against the model's context window, counted exactly via its tokenizer.
 - **Shell command output** — shown in a bordered panel as it happens, so
@@ -232,7 +252,17 @@ your host shell:
 - No network access by default (`--sandbox-network` to opt in)
 - Memory and CPU capped (512MB / 1 CPU by default — edit `Sandbox.__init__`
   in `astryx_cli/sandbox.py` to change)
-- Container is created fresh at session start and removed on exit
+- Runs as root inside the container by default (needed for `pip install`
+  and similar to work without extra setup); `--sandbox-nonroot` switches
+  to uid 1000 for more defense-in-depth, at the cost of breaking commands
+  that need root inside the container
+- Commands run via `sh -c`, not `bash -c` — works on minimal/Alpine-style
+  base images too, not just the default `python:3.11-slim`, in case you
+  ever change `SANDBOX_IMAGE`
+- Container is created fresh at session start and removed on exit — and
+  if a previous run's container got orphaned (crash, `SIGKILL`, a closed
+  laptop lid), the next `--sandbox` invocation cleans it up automatically
+  before starting a new one, rather than leaving it running indefinitely
 
 Because the container is the actual safety boundary here, commands run
 without a per-command confirmation — you'll still see every command and
